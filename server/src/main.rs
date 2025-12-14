@@ -85,7 +85,8 @@ async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_headers(Any)
+        .expose_headers(Any);
 
     // API routes
     let api_routes = Router::new()
@@ -94,6 +95,7 @@ async fn main() {
         .route("/volumes/{id}/info", get(routes::get_volume_info))
         .route("/volumes/{id}/low", get(routes::get_volume_low))
         .route("/volumes/{id}/full", get(routes::get_volume_full))
+        .route("/volumes/{id}/at/{resolution}", get(routes::get_volume_at_resolution))
         .with_state(state.clone());
 
     // Main router

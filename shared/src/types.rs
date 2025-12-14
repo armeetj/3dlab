@@ -39,6 +39,15 @@ pub struct UploadResponse {
     pub message: Option<String>,
 }
 
+/// Response for resampled volume data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResampledVolumeResponse {
+    /// Actual dimensions after resampling [x, y, z]
+    pub dimensions: [u32; 3],
+    /// Size in bytes
+    pub size: u64,
+}
+
 /// Error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {

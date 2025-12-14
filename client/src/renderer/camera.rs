@@ -23,7 +23,7 @@ impl Default for Camera {
         Self {
             distance: 2.0,
             yaw: 0.0,
-            pitch: 0.3,
+            pitch: 0.0,  // Fixed position, no rotation
             target: Vec3::ZERO,
             fov: 45.0_f32.to_radians(),
             near: 0.1,
@@ -59,7 +59,7 @@ impl Camera {
     /// Rotate camera by delta angles
     pub fn rotate(&mut self, delta_yaw: f32, delta_pitch: f32) {
         self.yaw += delta_yaw;
-        self.pitch = (self.pitch + delta_pitch).clamp(-1.5, 1.5);
+        self.pitch += delta_pitch;
     }
 
     /// Zoom camera by delta distance

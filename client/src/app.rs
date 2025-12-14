@@ -30,6 +30,8 @@ struct RenderParams {
     step_size: f32,
     value_range: [f32; 2],
     has_volume: bool,
+    volume_rotation: glam::Mat4,
+    show_axes: bool,
 }
 
 impl Default for RenderParams {
@@ -41,6 +43,8 @@ impl Default for RenderParams {
             step_size: 0.005,
             value_range: [0.0, 1.0],
             has_volume: false,
+            volume_rotation: glam::Mat4::IDENTITY,
+            show_axes: true,
         }
     }
 }
@@ -76,6 +80,14 @@ pub struct App {
     camera: Camera,
     /// Track if we have a volume loaded
     has_volume: bool,
+    /// Volume rotation as quaternion (for trackball-style rotation)
+    volume_rotation: glam::Quat,
+    /// Show XYZ axis indicators
+    show_axes: bool,
+    /// Target resolution for volume (largest dimension)
+    target_resolution: u32,
+    /// Currently loaded resolution
+    loaded_resolution: u32,
 }
 
 impl App {
@@ -154,6 +166,10 @@ impl App {
             shared_render_state,
             camera: Camera::default(),
             has_volume: false,
+            volume_rotation: glam::Quat::IDENTITY,
+            show_axes: true,
+            target_resolution: 256,
+            loaded_resolution: 0,
         };
 
         app.fetch_volumes();
@@ -222,7 +238,7 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let url = format!("{}/api/volumes/{}/low", self.api_base, volume_id);
+            let url = format!("{}/api/volumes/{}/full", self.api_base, volume_id);
             match reqwest::blocking::get(&url) {
                 Ok(response) => match response.bytes() {
                     Ok(bytes) => {
@@ -235,7 +251,7 @@ impl App {
                             if let Ok(mut state) = self.async_state.lock() {
                                 state.volume_data = Some(Ok(VolumeData {
                                     data,
-                                    dims: info.low_res_dimensions,
+                                    dims: info.dimensions,
                                     value_range: info.value_range,
                                 }));
                             }
@@ -258,7 +274,7 @@ impl App {
             use gloo_net::http::Request;
 
             let state = self.async_state.clone();
-            let url = format!("{}/api/volumes/{}/low", self.api_base, volume_id);
+            let url = format!("{}/api/volumes/{}/full", self.api_base, volume_id);
 
             wasm_bindgen_futures::spawn_local(async move {
                 let result = async {
@@ -278,12 +294,121 @@ impl App {
                         .collect();
 
                     let (dims, value_range) = if let Some(info) = volume_info {
-                        (info.low_res_dimensions, info.value_range)
+                        (info.dimensions, info.value_range)
                     } else {
                         // Fallback: try to infer cubic dimensions from data length
                         let side = (data.len() as f32).cbrt().round() as u32;
                         ([side, side, side], [0.0, 1.0])
                     };
+
+                    Ok::<_, String>(VolumeData {
+                        data,
+                        dims,
+                        value_range,
+                    })
+                }
+                .await;
+
+                if let Ok(mut state) = state.lock() {
+                    state.volume_data = Some(result);
+                }
+            });
+        }
+    }
+
+    fn fetch_volume_at_resolution(&mut self, volume_id: &str, resolution: u32) {
+        self.loading_volume = true;
+
+        let volume_info = self.volumes.iter().find(|v| v.id == volume_id).cloned();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let url = format!("{}/api/volumes/{}/at/{}", self.api_base, volume_id, resolution);
+            match reqwest::blocking::get(&url) {
+                Ok(response) => {
+                    // Get dimensions from header
+                    let dims: [u32; 3] = response
+                        .headers()
+                        .get("x-volume-dims")
+                        .and_then(|h| h.to_str().ok())
+                        .map(|s| {
+                            let parts: Vec<u32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                            if parts.len() == 3 {
+                                [parts[0], parts[1], parts[2]]
+                            } else {
+                                [resolution, resolution, resolution]
+                            }
+                        })
+                        .unwrap_or([resolution, resolution, resolution]);
+
+                    match response.bytes() {
+                        Ok(bytes) => {
+                            let data: Vec<f32> = bytes
+                                .chunks_exact(4)
+                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                .collect();
+
+                            let value_range = volume_info.map(|i| i.value_range).unwrap_or([0.0, 1.0]);
+
+                            if let Ok(mut state) = self.async_state.lock() {
+                                state.volume_data = Some(Ok(VolumeData {
+                                    data,
+                                    dims,
+                                    value_range,
+                                }));
+                            }
+                        }
+                        Err(e) => {
+                            self.error = Some(format!("Failed to read volume data: {}", e));
+                            self.loading_volume = false;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("Failed to fetch volume: {}", e));
+                    self.loading_volume = false;
+                }
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            use gloo_net::http::Request;
+
+            let state = self.async_state.clone();
+            let url = format!("{}/api/volumes/{}/at/{}", self.api_base, volume_id, resolution);
+            let value_range = volume_info.map(|i| i.value_range).unwrap_or([0.0, 1.0]);
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = async {
+                    let response = Request::get(&url)
+                        .send()
+                        .await
+                        .map_err(|e| format!("Request failed: {}", e))?;
+
+                    // Get dimensions from header
+                    let dims: [u32; 3] = response
+                        .headers()
+                        .get("x-volume-dims")
+                        .map(|s| {
+                            let parts: Vec<u32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
+                            if parts.len() == 3 {
+                                [parts[0], parts[1], parts[2]]
+                            } else {
+                                [resolution, resolution, resolution]
+                            }
+                        })
+                        .unwrap_or([resolution, resolution, resolution]);
+
+                    let bytes = response
+                        .binary()
+                        .await
+                        .map_err(|e| format!("Failed to read bytes: {}", e))?;
+
+                    let data: Vec<f32> = bytes
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect();
 
                     Ok::<_, String>(VolumeData {
                         data,
@@ -404,11 +529,72 @@ impl App {
 
         ui.separator();
 
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-            ui.label("3DLab v0.1.0");
+        // Rotation controls (Euler angles derived from quaternion)
+        ui.label("Rotation:");
+
+        // Derive Euler angles from quaternion for display
+        let (euler_x, euler_y, euler_z) = self.volume_rotation.to_euler(glam::EulerRot::XYZ);
+        let mut euler_deg = [
+            euler_x.to_degrees(),
+            euler_y.to_degrees(),
+            euler_z.to_degrees(),
+        ];
+
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            ui.label("X:");
+            changed |= ui.add(egui::DragValue::new(&mut euler_deg[0]).speed(1.0).suffix("°")).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Y:");
+            changed |= ui.add(egui::DragValue::new(&mut euler_deg[1]).speed(1.0).suffix("°")).changed();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Z:");
+            changed |= ui.add(egui::DragValue::new(&mut euler_deg[2]).speed(1.0).suffix("°")).changed();
         });
 
+        // If slider changed, convert back to quaternion
+        if changed {
+            self.volume_rotation = glam::Quat::from_euler(
+                glam::EulerRot::XYZ,
+                euler_deg[0].to_radians(),
+                euler_deg[1].to_radians(),
+                euler_deg[2].to_radians(),
+            );
+        }
+
+        if ui.button("Reset Rotation").clicked() {
+            self.volume_rotation = glam::Quat::IDENTITY;
+        }
+
+        ui.separator();
+
+        // Axes toggle
+        ui.checkbox(&mut self.show_axes, "Show Axes");
+
+        ui.separator();
+
+        // Resolution slider
+        ui.label("Resolution:");
+        let old_resolution = self.target_resolution;
+        ui.add(egui::Slider::new(&mut self.target_resolution, 32..=512).text("px"));
+        if old_resolution != self.target_resolution && !self.loading_volume {
+            // Resolution changed, trigger reload if we have a volume selected
+            if let Some(ref id) = self.selected_volume {
+                volume_changed = Some(format!("{}@{}", id, self.target_resolution));
+            }
+        }
+
+        ui.separator();
+
         volume_changed
+    }
+
+    fn render_footer(&self, ui: &mut egui::Ui) {
+        let fps = 1.0 / ui.ctx().input(|i| i.stable_dt).max(0.001);
+        ui.label(format!("{:.0} fps", fps));
+        ui.label("3DLab v0.1.0");
     }
 
     fn render_viewport(&mut self, ui: &mut egui::Ui, _gl: &Arc<glow::Context>) {
@@ -417,11 +603,18 @@ impl App {
 
         let aspect_ratio = rect.width() / rect.height();
 
-        // Handle drag for camera rotation
+        // Handle drag for volume rotation (trackball-style, view-relative)
         if response.dragged() {
             let delta = response.drag_delta();
-            let sensitivity = 0.01;
-            self.camera.rotate(-delta.x * sensitivity, -delta.y * sensitivity);
+            let sensitivity = 0.01;  // radians per pixel
+
+            // Rotate around screen axes (Y for horizontal drag, X for vertical drag)
+            let rot_y = glam::Quat::from_axis_angle(glam::Vec3::Y, delta.x * sensitivity);
+            let rot_x = glam::Quat::from_axis_angle(glam::Vec3::X, delta.y * sensitivity);
+
+            // Apply incremental rotation: new = delta * current
+            self.volume_rotation = (rot_y * rot_x) * self.volume_rotation;
+            self.volume_rotation = self.volume_rotation.normalize();
         }
 
         // Handle zoom with scroll
@@ -430,12 +623,17 @@ impl App {
             self.camera.zoom(scroll_delta * 0.01);
         }
 
+        // Build volume rotation matrix from quaternion
+        let volume_rotation = glam::Mat4::from_quat(self.volume_rotation);
+
         // Update shared render state with camera params
         if let Ok(mut state) = self.shared_render_state.lock() {
             state.params.camera_position = self.camera.position();
             state.params.view_proj_matrix = self.camera.view_projection_matrix(aspect_ratio);
             state.params.aspect_ratio = aspect_ratio;
             state.params.has_volume = self.has_volume;
+            state.params.volume_rotation = volume_rotation;
+            state.params.show_axes = self.show_axes;
         }
 
         if !self.has_volume {
@@ -499,7 +697,17 @@ impl App {
                                         &state.params.camera_position,
                                         state.params.step_size,
                                         state.params.value_range,
+                                        &state.params.volume_rotation,
                                     );
+
+                                    // Render axes if enabled
+                                    if state.params.show_axes {
+                                        renderer.render_axes(
+                                            painter.gl(),
+                                            &state.params.view_proj_matrix,
+                                            &state.params.volume_rotation,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -536,6 +744,9 @@ impl eframe::App for App {
                 if let Some(new_volume) = self.render_sidebar(ui) {
                     volume_to_fetch = Some(new_volume);
                 }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    self.render_footer(ui);
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -555,9 +766,21 @@ impl eframe::App for App {
             }
         });
 
-        if let Some(volume_id) = volume_to_fetch {
-            if self.loaded_volume.as_ref() != Some(&volume_id) {
-                self.fetch_volume_data(&volume_id);
+        if let Some(volume_request) = volume_to_fetch {
+            // Check if this is a resolution change (format: "volume_id@resolution")
+            if let Some((volume_id, resolution_str)) = volume_request.split_once('@') {
+                if let Ok(resolution) = resolution_str.parse::<u32>() {
+                    // Resolution change request
+                    self.fetch_volume_at_resolution(volume_id, resolution);
+                    self.loaded_resolution = resolution;
+                }
+            } else {
+                // Normal volume selection
+                let volume_id = volume_request;
+                if self.loaded_volume.as_ref() != Some(&volume_id) {
+                    self.fetch_volume_at_resolution(&volume_id, self.target_resolution);
+                    self.loaded_resolution = self.target_resolution;
+                }
             }
         }
     }

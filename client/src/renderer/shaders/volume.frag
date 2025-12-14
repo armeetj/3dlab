@@ -7,6 +7,7 @@ uniform float u_step_size;
 uniform float u_value_min;
 uniform float u_value_max;
 uniform sampler3D u_volume;
+uniform mat4 u_volume_rotation;
 
 in vec3 v_world_pos;
 out vec4 out_color;
@@ -63,8 +64,22 @@ void main() {
 
         vec3 sample_pos = ray_origin + ray_dir * t_current;
 
+        // Apply inverse rotation (transpose for orthogonal matrix) around volume center
+        vec3 centered = sample_pos - vec3(0.5);
+        vec3 rotated = (transpose(u_volume_rotation) * vec4(centered, 1.0)).xyz;
+        vec3 rotated_pos = rotated + vec3(0.5);
+
         // Sample volume texture
-        float density = texture(u_volume, sample_pos).r;
+        // Texture axes are swapped: (Z, Y, X) due to row-major memory layout
+        vec3 tex_coord = vec3(rotated_pos.z, rotated_pos.y, rotated_pos.x);
+
+        // Skip samples outside the unit cube (after rotation, some rays may exit early)
+        if (any(lessThan(tex_coord, vec3(0.0))) || any(greaterThan(tex_coord, vec3(1.0)))) {
+            t_current += u_step_size;
+            continue;
+        }
+
+        float density = texture(u_volume, tex_coord).r;
 
         // Apply transfer function
         vec4 sample_color = transfer_function(density);

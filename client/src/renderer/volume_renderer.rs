@@ -4,6 +4,8 @@ use super::camera::Camera;
 
 const VERTEX_SHADER: &str = include_str!("shaders/volume.vert");
 const FRAGMENT_SHADER: &str = include_str!("shaders/volume.frag");
+const AXES_VERTEX_SHADER: &str = include_str!("shaders/axes.vert");
+const AXES_FRAGMENT_SHADER: &str = include_str!("shaders/axes.frag");
 
 /// Volume renderer using OpenGL ray marching
 pub struct VolumeRenderer {
@@ -20,6 +22,13 @@ pub struct VolumeRenderer {
     u_value_min: Option<glow::UniformLocation>,
     u_value_max: Option<glow::UniformLocation>,
     u_volume: Option<glow::UniformLocation>,
+    u_volume_rotation: Option<glow::UniformLocation>,
+    // Axes rendering
+    axes_program: glow::Program,
+    axes_vao: glow::VertexArray,
+    axes_vbo: glow::Buffer,
+    axes_u_view_proj: Option<glow::UniformLocation>,
+    axes_u_model: Option<glow::UniformLocation>,
 }
 
 impl VolumeRenderer {
@@ -60,9 +69,77 @@ impl VolumeRenderer {
             let u_value_min = gl.get_uniform_location(program, "u_value_min");
             let u_value_max = gl.get_uniform_location(program, "u_value_max");
             let u_volume = gl.get_uniform_location(program, "u_volume");
+            let u_volume_rotation = gl.get_uniform_location(program, "u_volume_rotation");
 
             // Create VAO (required for WebGL2/OpenGL ES 3.0)
             let vao = gl.create_vertex_array().unwrap();
+
+            // === Axes shader setup ===
+            let axes_vs = gl.create_shader(glow::VERTEX_SHADER).unwrap();
+            gl.shader_source(axes_vs, AXES_VERTEX_SHADER);
+            gl.compile_shader(axes_vs);
+            if !gl.get_shader_compile_status(axes_vs) {
+                panic!("Axes vertex shader error: {}", gl.get_shader_info_log(axes_vs));
+            }
+
+            let axes_fs = gl.create_shader(glow::FRAGMENT_SHADER).unwrap();
+            gl.shader_source(axes_fs, AXES_FRAGMENT_SHADER);
+            gl.compile_shader(axes_fs);
+            if !gl.get_shader_compile_status(axes_fs) {
+                panic!("Axes fragment shader error: {}", gl.get_shader_info_log(axes_fs));
+            }
+
+            let axes_program = gl.create_program().unwrap();
+            gl.attach_shader(axes_program, axes_vs);
+            gl.attach_shader(axes_program, axes_fs);
+            gl.link_program(axes_program);
+            if !gl.get_program_link_status(axes_program) {
+                panic!("Axes program link error: {}", gl.get_program_info_log(axes_program));
+            }
+
+            gl.delete_shader(axes_vs);
+            gl.delete_shader(axes_fs);
+
+            let axes_u_view_proj = gl.get_uniform_location(axes_program, "u_view_proj");
+            let axes_u_model = gl.get_uniform_location(axes_program, "u_model");
+
+            // Create axes vertex data: 6 vertices (2 per axis), each with position + color
+            // Position (3 floats) + Color (3 floats) = 6 floats per vertex
+            // X axis: Red (1,0,0), Y axis: Green (0,1,0), Z axis: Blue (0,0,1)
+            let axis_length = 0.3;
+            let axes_vertices: [f32; 36] = [
+                // X axis (red)
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0,  // origin
+                axis_length, 0.0, 0.0, 1.0, 0.0, 0.0,  // +X
+                // Y axis (green)
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0,  // origin
+                0.0, axis_length, 0.0, 0.0, 1.0, 0.0,  // +Y
+                // Z axis (blue)
+                0.0, 0.0, 0.0, 0.0, 0.0, 1.0,  // origin
+                0.0, 0.0, axis_length, 0.0, 0.0, 1.0,  // +Z
+            ];
+
+            let axes_vao = gl.create_vertex_array().unwrap();
+            let axes_vbo = gl.create_buffer().unwrap();
+
+            gl.bind_vertex_array(Some(axes_vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(axes_vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&axes_vertices),
+                glow::STATIC_DRAW,
+            );
+
+            // Position attribute (location 0)
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, 24, 0);
+
+            // Color attribute (location 1)
+            gl.enable_vertex_attrib_array(1);
+            gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 24, 12);
+
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
 
             Self {
                 program,
@@ -77,6 +154,12 @@ impl VolumeRenderer {
                 u_value_min,
                 u_value_max,
                 u_volume,
+                u_volume_rotation,
+                axes_program,
+                axes_vao,
+                axes_vbo,
+                axes_u_view_proj,
+                axes_u_model,
             }
         }
     }
@@ -113,13 +196,15 @@ impl VolumeRenderer {
             let bytes: &[u8] = bytemuck::cast_slice(data);
 
             // Upload texture data
+            // Note: dims from server are [X, Y, Z] but data is row-major with Z varying fastest
+            // OpenGL expects width (fastest) first, so we swap: [Z, Y, X]
             gl.tex_image_3d(
                 glow::TEXTURE_3D,
                 0,
                 glow::R32F as i32,
-                dims[0] as i32,
-                dims[1] as i32,
-                dims[2] as i32,
+                dims[2] as i32,  // width = Z (fastest varying in memory)
+                dims[1] as i32,  // height = Y
+                dims[0] as i32,  // depth = X (slowest varying in memory)
                 0,
                 glow::RED,
                 glow::FLOAT,
@@ -141,7 +226,7 @@ impl VolumeRenderer {
     pub fn render(&self, gl: &glow::Context, aspect_ratio: f32) {
         let view_proj = self.camera.view_projection_matrix(aspect_ratio);
         let camera_pos = self.camera.position();
-        self.render_with_params(gl, &view_proj, &camera_pos, 0.005, self.value_range);
+        self.render_with_params(gl, &view_proj, &camera_pos, 0.005, self.value_range, &glam::Mat4::IDENTITY);
     }
 
     /// Render the volume with explicit parameters
@@ -152,6 +237,7 @@ impl VolumeRenderer {
         camera_pos: &glam::Vec3,
         step_size: f32,
         value_range: [f32; 2],
+        volume_rotation: &glam::Mat4,
     ) {
         if self.volume_texture.is_none() {
             return;
@@ -189,6 +275,11 @@ impl VolumeRenderer {
                 gl.uniform_1_f32(Some(loc), value_range[1]);
             }
 
+            // Set volume rotation matrix
+            if let Some(loc) = &self.u_volume_rotation {
+                gl.uniform_matrix_4_f32_slice(Some(loc), false, &volume_rotation.to_cols_array());
+            }
+
             // Bind volume texture
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_3D, self.volume_texture);
@@ -208,6 +299,42 @@ impl VolumeRenderer {
         }
     }
 
+    /// Render coordinate axes
+    pub fn render_axes(
+        &self,
+        gl: &glow::Context,
+        view_proj: &glam::Mat4,
+        volume_rotation: &glam::Mat4,
+    ) {
+        unsafe {
+            gl.disable(glow::DEPTH_TEST);
+            gl.line_width(2.0);
+
+            gl.use_program(Some(self.axes_program));
+            gl.bind_vertex_array(Some(self.axes_vao));
+
+            // Set uniforms
+            if let Some(loc) = &self.axes_u_view_proj {
+                gl.uniform_matrix_4_f32_slice(Some(loc), false, &view_proj.to_cols_array());
+            }
+
+            // Model matrix: translate to corner of volume and apply rotation
+            // Position axes at (-0.5, -0.5, -0.5) corner so they don't obscure the volume
+            let translation = glam::Mat4::from_translation(glam::Vec3::new(-0.5, -0.5, -0.5));
+            let model = translation * *volume_rotation;
+
+            if let Some(loc) = &self.axes_u_model {
+                gl.uniform_matrix_4_f32_slice(Some(loc), false, &model.to_cols_array());
+            }
+
+            // Draw 6 vertices as 3 lines
+            gl.draw_arrays(glow::LINES, 0, 6);
+
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+        }
+    }
+
     /// Clean up OpenGL resources
     pub fn destroy(&self, gl: &glow::Context) {
         unsafe {
@@ -216,6 +343,9 @@ impl VolumeRenderer {
             if let Some(tex) = self.volume_texture {
                 gl.delete_texture(tex);
             }
+            gl.delete_program(self.axes_program);
+            gl.delete_vertex_array(self.axes_vao);
+            gl.delete_buffer(self.axes_vbo);
         }
     }
 }

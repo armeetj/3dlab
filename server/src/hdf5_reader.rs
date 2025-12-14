@@ -165,4 +165,27 @@ impl HDF5Volume {
         .await
         .unwrap()
     }
+
+    /// Get volume data resampled to a target resolution
+    /// Returns (bytes, [x, y, z] dimensions)
+    pub async fn get_data_at_resolution(&self, target_size: usize) -> Result<(Vec<u8>, [u32; 3]), HDF5Error> {
+        let path = self.path.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let file = File::open(&path)?;
+            let dataset = file
+                .dataset("target")
+                .or_else(|_| file.dataset("volume"))
+                .or_else(|_| file.dataset("data"))
+                .map_err(|_| HDF5Error::DatasetNotFound("target, volume, or data".to_string()))?;
+
+            let data: Array3<f32> = dataset.read()?;
+            let resampled = Self::downsample(&data, target_size);
+            let shape = resampled.shape();
+            let dims = [shape[0] as u32, shape[1] as u32, shape[2] as u32];
+            Ok((Self::to_bytes(&resampled), dims))
+        })
+        .await
+        .unwrap()
+    }
 }

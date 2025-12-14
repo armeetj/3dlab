@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -94,6 +94,46 @@ pub async fn get_volume_full(
                 [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
                 data,
             )),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to read volume: {}", e),
+                }),
+            )),
+        },
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Volume '{}' not found", id),
+            }),
+        )),
+    }
+}
+
+/// GET /api/volumes/:id/at/:resolution - Get volume data at specific resolution
+/// Resolution is the target size for the largest dimension (e.g., 64, 128, 256)
+pub async fn get_volume_at_resolution(
+    State(state): State<Arc<AppState>>,
+    Path((id, resolution)): Path<(String, usize)>,
+) -> impl IntoResponse {
+    // Clamp resolution to reasonable bounds
+    let resolution = resolution.clamp(16, 512);
+
+    match state.get_volume(&id) {
+        Some(volume) => match volume.get_data_at_resolution(resolution).await {
+            Ok((data, dims)) => {
+                // Return binary data with dimensions in headers
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    axum::http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/octet-stream"),
+                );
+                headers.insert(
+                    "x-volume-dims",
+                    HeaderValue::from_str(&format!("{},{},{}", dims[0], dims[1], dims[2])).unwrap(),
+                );
+                Ok((headers, data))
+            },
             Err(e) => Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
