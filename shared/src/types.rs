@@ -7,8 +7,10 @@ pub struct VolumeInfo {
     pub id: String,
     /// Human-readable name
     pub name: String,
-    /// Dimensions [x, y, z]
+    /// Full resolution dimensions [x, y, z]
     pub dimensions: [u32; 3],
+    /// Low-res preview dimensions [x, y, z]
+    pub low_res_dimensions: [u32; 3],
     /// Size of low-res preview in bytes
     pub low_res_size: u64,
     /// Size of full resolution in bytes

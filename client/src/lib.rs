@@ -1,6 +1,8 @@
 mod app;
+mod renderer;
 
 pub use app::App;
+pub use renderer::{Camera, VolumeRenderer};
 
 // WASM entry point
 #[cfg(target_arch = "wasm32")]
@@ -49,15 +51,20 @@ pub fn start() -> Result<(), JsValue> {
         .append_child(&canvas)
         .expect("Failed to append canvas");
 
-    // Start the app
+    // Start the app with glow (OpenGL/WebGL2)
     let web_options = eframe::WebOptions::default();
 
     wasm_bindgen_futures::spawn_local(async move {
+        log::info!("Starting eframe...");
+
         let start_result = eframe::WebRunner::new()
             .start(
                 canvas,
                 web_options,
-                Box::new(|cc| Ok(Box::new(App::new(cc)))),
+                Box::new(|cc| {
+                    log::info!("Creating app, glow available: {}", cc.gl.is_some());
+                    Ok(Box::new(App::new(cc)))
+                }),
             )
             .await;
 
@@ -70,8 +77,9 @@ pub fn start() -> Result<(), JsValue> {
             }
         }
 
-        if let Err(e) = start_result {
-            log::error!("Failed to start eframe: {:?}", e);
+        match &start_result {
+            Ok(_) => log::info!("eframe started successfully"),
+            Err(e) => log::error!("Failed to start eframe: {:?}", e),
         }
     });
 

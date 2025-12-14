@@ -68,6 +68,12 @@ impl HDF5Volume {
 
         // Generate low-res version (downsample to ~64^3)
         let low_res = Self::downsample(&data, 64);
+        let low_res_shape = low_res.shape();
+        let low_res_dims = [
+            low_res_shape[0] as u32,
+            low_res_shape[1] as u32,
+            low_res_shape[2] as u32,
+        ];
         let low_res_bytes = Self::to_bytes(&low_res);
 
         // Calculate sizes
@@ -87,6 +93,7 @@ impl HDF5Volume {
             id,
             name,
             dimensions: dims,
+            low_res_dimensions: low_res_dims,
             low_res_size,
             full_res_size,
             value_range: [min_val, max_val],
