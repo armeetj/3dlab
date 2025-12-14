@@ -2,6 +2,11 @@
 
 A WebGL-based 3D MRI volume renderer. Rust server reads HDF5 files, Rust/WASM client renders in browser. Originally made to address a problem I had when working on AI models for MRI recon at Caltech. The 3D volumes I was working with were too large to visualize with standard python plotting tools. At best, I would generate 2D cross-section visualizations with matplotlib or plotly. I wrote this simple renderer to quickly visualize 3D MRI volumes in the browser, but it should work for any 3D volume stored in HDF5 format.
 
+Right now, I can render a 512x512x160 (~170MB) volume in the browser at ~20 fps on my 2021 M1 Pro Macbook Pro.
+
+<img width="2535" height="1350" alt="image" src="https://github.com/user-attachments/assets/996e8c92-9cce-43a0-805c-91737a65b24c" />
+
+
 **Important:** This is a hobby project and not production-ready software. I'm no graphics/shader specialist and much of the project was written with heavy assistance from my good friend Opus at Claude Code :)
 
 For now, the project is a bit rough around the edges, but it works well enough for my needs. Feel free to fork and improve! I've chosen a client-server architecture to allow for potential future expansion (e.g., loading volumes from a database, more advanced chunking and rendering of massive volumes, etc).
