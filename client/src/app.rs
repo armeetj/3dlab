@@ -82,6 +82,8 @@ pub struct App {
     has_volume: bool,
     /// Volume rotation as quaternion (for trackball-style rotation)
     volume_rotation: glam::Quat,
+    /// Euler angles in degrees (for slider display, synced with quaternion)
+    volume_euler_deg: [f32; 3],
     /// Show XYZ axis indicators
     show_axes: bool,
     /// Target resolution for volume (largest dimension)
@@ -167,6 +169,7 @@ impl App {
             camera: Camera::default(),
             has_volume: false,
             volume_rotation: glam::Quat::IDENTITY,
+            volume_euler_deg: [0.0, 0.0, 0.0],
             show_axes: true,
             target_resolution: 256,
             loaded_resolution: 0,
@@ -529,43 +532,36 @@ impl App {
 
         ui.separator();
 
-        // Rotation controls (Euler angles derived from quaternion)
+        // Rotation controls (Euler angles synced with quaternion)
         ui.label("Rotation:");
-
-        // Derive Euler angles from quaternion for display
-        let (euler_x, euler_y, euler_z) = self.volume_rotation.to_euler(glam::EulerRot::XYZ);
-        let mut euler_deg = [
-            euler_x.to_degrees(),
-            euler_y.to_degrees(),
-            euler_z.to_degrees(),
-        ];
 
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label("X:");
-            changed |= ui.add(egui::DragValue::new(&mut euler_deg[0]).speed(1.0).suffix("°")).changed();
+            changed |= ui.add(egui::DragValue::new(&mut self.volume_euler_deg[0]).speed(1.0).suffix("°")).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Y:");
-            changed |= ui.add(egui::DragValue::new(&mut euler_deg[1]).speed(1.0).suffix("°")).changed();
+            changed |= ui.add(egui::DragValue::new(&mut self.volume_euler_deg[1]).speed(1.0).suffix("°")).changed();
         });
         ui.horizontal(|ui| {
             ui.label("Z:");
-            changed |= ui.add(egui::DragValue::new(&mut euler_deg[2]).speed(1.0).suffix("°")).changed();
+            changed |= ui.add(egui::DragValue::new(&mut self.volume_euler_deg[2]).speed(1.0).suffix("°")).changed();
         });
 
-        // If slider changed, convert back to quaternion
+        // If slider changed, update quaternion from Euler
         if changed {
             self.volume_rotation = glam::Quat::from_euler(
                 glam::EulerRot::XYZ,
-                euler_deg[0].to_radians(),
-                euler_deg[1].to_radians(),
-                euler_deg[2].to_radians(),
+                self.volume_euler_deg[0].to_radians(),
+                self.volume_euler_deg[1].to_radians(),
+                self.volume_euler_deg[2].to_radians(),
             );
         }
 
         if ui.button("Reset Rotation").clicked() {
             self.volume_rotation = glam::Quat::IDENTITY;
+            self.volume_euler_deg = [0.0, 0.0, 0.0];
         }
 
         ui.separator();
@@ -615,6 +611,10 @@ impl App {
             // Apply incremental rotation: new = delta * current
             self.volume_rotation = (rot_y * rot_x) * self.volume_rotation;
             self.volume_rotation = self.volume_rotation.normalize();
+
+            // Sync Euler angles from quaternion for slider display
+            let (ex, ey, ez) = self.volume_rotation.to_euler(glam::EulerRot::XYZ);
+            self.volume_euler_deg = [ex.to_degrees(), ey.to_degrees(), ez.to_degrees()];
         }
 
         // Handle zoom with scroll
