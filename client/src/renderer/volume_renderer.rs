@@ -7,11 +7,15 @@ const FRAGMENT_SHADER: &str = include_str!("shaders/volume.frag");
 const AXES_VERTEX_SHADER: &str = include_str!("shaders/axes.vert");
 const AXES_FRAGMENT_SHADER: &str = include_str!("shaders/axes.frag");
 
+/// Size of the occupancy grid (cells per dimension)
+const OCCUPANCY_GRID_SIZE: u32 = 16;
+
 /// Volume renderer using OpenGL ray marching
 pub struct VolumeRenderer {
     program: glow::Program,
     vao: glow::VertexArray,
     volume_texture: Option<glow::Texture>,
+    occupancy_texture: Option<glow::Texture>,
     pub camera: Camera,
     volume_dims: [u32; 3],
     value_range: [f32; 2],
@@ -23,6 +27,9 @@ pub struct VolumeRenderer {
     u_value_max: Option<glow::UniformLocation>,
     u_volume: Option<glow::UniformLocation>,
     u_volume_rotation: Option<glow::UniformLocation>,
+    u_occupancy: Option<glow::UniformLocation>,
+    u_occupancy_size: Option<glow::UniformLocation>,
+    u_opacity: Option<glow::UniformLocation>,
     // Axes rendering
     axes_program: glow::Program,
     axes_vao: glow::VertexArray,
@@ -70,6 +77,9 @@ impl VolumeRenderer {
             let u_value_max = gl.get_uniform_location(program, "u_value_max");
             let u_volume = gl.get_uniform_location(program, "u_volume");
             let u_volume_rotation = gl.get_uniform_location(program, "u_volume_rotation");
+            let u_occupancy = gl.get_uniform_location(program, "u_occupancy");
+            let u_occupancy_size = gl.get_uniform_location(program, "u_occupancy_size");
+            let u_opacity = gl.get_uniform_location(program, "u_opacity");
 
             // Create VAO (required for WebGL2/OpenGL ES 3.0)
             let vao = gl.create_vertex_array().unwrap();
@@ -145,6 +155,7 @@ impl VolumeRenderer {
                 program,
                 vao,
                 volume_texture: None,
+                occupancy_texture: None,
                 camera: Camera::default(),
                 volume_dims: [1, 1, 1],
                 value_range: [0.0, 1.0],
@@ -155,6 +166,9 @@ impl VolumeRenderer {
                 u_value_max,
                 u_volume,
                 u_volume_rotation,
+                u_occupancy,
+                u_occupancy_size,
+                u_opacity,
                 axes_program,
                 axes_vao,
                 axes_vbo,
@@ -176,12 +190,15 @@ impl VolumeRenderer {
         self.value_range = value_range;
 
         unsafe {
-            // Delete old texture if exists
+            // Delete old textures if they exist
             if let Some(tex) = self.volume_texture.take() {
                 gl.delete_texture(tex);
             }
+            if let Some(tex) = self.occupancy_texture.take() {
+                gl.delete_texture(tex);
+            }
 
-            // Create 3D texture
+            // Create 3D texture for volume
             let texture = gl.create_texture().unwrap();
             gl.bind_texture(glow::TEXTURE_3D, Some(texture));
 
@@ -212,9 +229,78 @@ impl VolumeRenderer {
             );
 
             gl.bind_texture(glow::TEXTURE_3D, None);
-
             self.volume_texture = Some(texture);
+
+            // Compute and upload occupancy grid
+            let occupancy = Self::compute_occupancy_grid(data, dims, value_range);
+            let occ_texture = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_3D, Some(occ_texture));
+
+            gl.tex_parameter_i32(glow::TEXTURE_3D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_3D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_3D, glow::TEXTURE_WRAP_R, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_3D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_3D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+
+            let occ_bytes: &[u8] = bytemuck::cast_slice(&occupancy);
+            gl.tex_image_3d(
+                glow::TEXTURE_3D,
+                0,
+                glow::R32F as i32,
+                OCCUPANCY_GRID_SIZE as i32,
+                OCCUPANCY_GRID_SIZE as i32,
+                OCCUPANCY_GRID_SIZE as i32,
+                0,
+                glow::RED,
+                glow::FLOAT,
+                Some(occ_bytes),
+            );
+
+            gl.bind_texture(glow::TEXTURE_3D, None);
+            self.occupancy_texture = Some(occ_texture);
         }
+    }
+
+    /// Compute occupancy grid from volume data
+    /// Returns a 3D grid where each cell is 1.0 if that region has data above threshold, 0.0 otherwise
+    fn compute_occupancy_grid(data: &[f32], dims: [u32; 3], value_range: [f32; 2]) -> Vec<f32> {
+        let grid_size = OCCUPANCY_GRID_SIZE as usize;
+        let mut occupancy = vec![0.0f32; grid_size * grid_size * grid_size];
+
+        // Threshold: consider occupied if normalized value > 0.02
+        let threshold = value_range[0] + (value_range[1] - value_range[0]) * 0.02;
+
+        // Size of each grid cell in volume voxels
+        let cell_size_x = (dims[0] as f32) / (grid_size as f32);
+        let cell_size_y = (dims[1] as f32) / (grid_size as f32);
+        let cell_size_z = (dims[2] as f32) / (grid_size as f32);
+
+        // For each voxel, mark its corresponding occupancy cell
+        for x in 0..dims[0] {
+            for y in 0..dims[1] {
+                for z in 0..dims[2] {
+                    // Volume data index (row-major, Z fastest)
+                    let vol_idx = (x * dims[1] * dims[2] + y * dims[2] + z) as usize;
+                    if vol_idx >= data.len() {
+                        continue;
+                    }
+
+                    let value = data[vol_idx];
+                    if value > threshold {
+                        // Map to occupancy grid cell
+                        let ox = ((x as f32) / cell_size_x).min((grid_size - 1) as f32) as usize;
+                        let oy = ((y as f32) / cell_size_y).min((grid_size - 1) as f32) as usize;
+                        let oz = ((z as f32) / cell_size_z).min((grid_size - 1) as f32) as usize;
+
+                        // Occupancy grid index (same layout as volume)
+                        let occ_idx = ox * grid_size * grid_size + oy * grid_size + oz;
+                        occupancy[occ_idx] = 1.0;
+                    }
+                }
+            }
+        }
+
+        occupancy
     }
 
     /// Check if volume data is loaded
@@ -226,7 +312,7 @@ impl VolumeRenderer {
     pub fn render(&self, gl: &glow::Context, aspect_ratio: f32) {
         let view_proj = self.camera.view_projection_matrix(aspect_ratio);
         let camera_pos = self.camera.position();
-        self.render_with_params(gl, &view_proj, &camera_pos, 0.005, self.value_range, &glam::Mat4::IDENTITY);
+        self.render_with_params(gl, &view_proj, &camera_pos, 0.005, self.value_range, &glam::Mat4::IDENTITY, 1.0);
     }
 
     /// Render the volume with explicit parameters
@@ -238,6 +324,7 @@ impl VolumeRenderer {
         step_size: f32,
         value_range: [f32; 2],
         volume_rotation: &glam::Mat4,
+        opacity: f32,
     ) {
         if self.volume_texture.is_none() {
             return;
@@ -280,6 +367,11 @@ impl VolumeRenderer {
                 gl.uniform_matrix_4_f32_slice(Some(loc), false, &volume_rotation.to_cols_array());
             }
 
+            // Set opacity
+            if let Some(loc) = &self.u_opacity {
+                gl.uniform_1_f32(Some(loc), opacity);
+            }
+
             // Bind volume texture
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_3D, self.volume_texture);
@@ -287,10 +379,23 @@ impl VolumeRenderer {
                 gl.uniform_1_i32(Some(loc), 0);
             }
 
+            // Bind occupancy texture
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_3D, self.occupancy_texture);
+            if let Some(loc) = &self.u_occupancy {
+                gl.uniform_1_i32(Some(loc), 1);
+            }
+            if let Some(loc) = &self.u_occupancy_size {
+                gl.uniform_1_f32(Some(loc), OCCUPANCY_GRID_SIZE as f32);
+            }
+
             // Draw cube (36 vertices)
             gl.draw_arrays(glow::TRIANGLES, 0, 36);
 
             // Clean up state
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_3D, None);
+            gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_3D, None);
             gl.bind_vertex_array(None);
             gl.use_program(None);
@@ -341,6 +446,9 @@ impl VolumeRenderer {
             gl.delete_program(self.program);
             gl.delete_vertex_array(self.vao);
             if let Some(tex) = self.volume_texture {
+                gl.delete_texture(tex);
+            }
+            if let Some(tex) = self.occupancy_texture {
                 gl.delete_texture(tex);
             }
             gl.delete_program(self.axes_program);

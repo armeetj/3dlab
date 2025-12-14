@@ -8,6 +8,9 @@ uniform float u_value_min;
 uniform float u_value_max;
 uniform sampler3D u_volume;
 uniform mat4 u_volume_rotation;
+uniform sampler3D u_occupancy;
+uniform float u_occupancy_size;  // Grid size (e.g., 16.0)
+uniform float u_opacity;  // Overall opacity multiplier (0.0 - 1.0)
 
 in vec3 v_world_pos;
 out vec4 out_color;
@@ -30,7 +33,8 @@ vec4 transfer_function(float density) {
     float normalized = clamp((density - u_value_min) / (u_value_max - u_value_min), 0.0, 1.0);
 
     // Simple opacity curve - higher values are more opaque
-    float alpha = pow(normalized, 2.0) * 0.5;
+    // Scale by u_opacity for user control
+    float alpha = pow(normalized, 2.0) * 0.5 * u_opacity;
 
     // Grayscale color
     vec3 color = vec3(normalized);
@@ -79,12 +83,24 @@ void main() {
             continue;
         }
 
+        // Check occupancy grid first (cheaper than volume sample)
+        // Occupancy uses same coordinate layout as volume
+        vec3 occ_coord = vec3(rotated_pos.z, rotated_pos.y, rotated_pos.x);
+        float occupied = texture(u_occupancy, occ_coord).r;
+
+        // If cell is empty, skip ahead by cell size
+        if (occupied < 0.5) {
+            // Skip to next cell (cell size = 1/occupancy_size)
+            t_current += 1.0 / u_occupancy_size;
+            continue;
+        }
+
         float density = texture(u_volume, tex_coord).r;
 
-        // Empty space skipping: take larger steps through low-density regions
+        // Fine-grained empty space skipping within occupied cells
         float normalized_density = (density - u_value_min) / (u_value_max - u_value_min);
         if (normalized_density < 0.02) {
-            t_current += u_step_size * 4.0;
+            t_current += u_step_size * 2.0;
             continue;
         }
 

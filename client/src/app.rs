@@ -21,6 +21,21 @@ struct VolumeData {
     value_range: [f32; 2],
 }
 
+/// Info about a point in the volume (for hover display)
+#[derive(Clone, Default)]
+struct HoverInfo {
+    /// Whether we have valid hover info
+    valid: bool,
+    /// Position in volume space [0,1]
+    position: [f32; 3],
+    /// Raw voxel value
+    value: f32,
+    /// Normalized value [0,1]
+    normalized: f32,
+    /// Voxel coordinates
+    voxel: [u32; 3],
+}
+
 /// Render state that can be shared across threads (no GL types)
 #[derive(Clone)]
 struct RenderParams {
@@ -32,6 +47,7 @@ struct RenderParams {
     has_volume: bool,
     volume_rotation: glam::Mat4,
     show_axes: bool,
+    opacity: f32,
 }
 
 impl Default for RenderParams {
@@ -45,6 +61,7 @@ impl Default for RenderParams {
             has_volume: false,
             volume_rotation: glam::Mat4::IDENTITY,
             show_axes: true,
+            opacity: 1.0,
         }
     }
 }
@@ -86,12 +103,14 @@ pub struct App {
     volume_euler_deg: [f32; 3],
     /// Show XYZ axis indicators
     show_axes: bool,
-    /// Resolution fraction (0.125 = 1/8, 1.0 = full)
-    resolution_fraction: f32,
-    /// Currently loaded resolution
-    loaded_resolution: u32,
     /// Render quality (0.0 = fast/low, 1.0 = slow/high)
     render_quality: f32,
+    /// Volume opacity (0.0 = transparent, 1.0 = opaque)
+    opacity: f32,
+    /// CPU copy of volume data for hover raycasting
+    cpu_volume_data: Option<VolumeData>,
+    /// Current hover info
+    hover_info: HoverInfo,
 }
 
 impl App {
@@ -142,12 +161,22 @@ impl App {
         style.spacing.combo_width = 0.0;
         style.spacing.menu_margin = egui::Margin::same(2.0);
         style.spacing.window_margin = egui::Margin::same(4.0);
+
+        // Use monospace font for everything
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Small, FontId::new(10.0, FontFamily::Monospace)),
+            (TextStyle::Body, FontId::new(13.0, FontFamily::Monospace)),
+            (TextStyle::Button, FontId::new(13.0, FontFamily::Monospace)),
+            (TextStyle::Heading, FontId::new(18.0, FontFamily::Monospace)),
+            (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        ].into();
+
         style
     }
 
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_style(Self::flat_style());
-        cc.egui_ctx.set_pixels_per_point(1.5);
 
         let api_base = if cfg!(target_arch = "wasm32") {
             String::new()
@@ -173,9 +202,10 @@ impl App {
             volume_rotation: glam::Quat::IDENTITY,
             volume_euler_deg: [0.0, 0.0, 0.0],
             show_axes: true,
-            resolution_fraction: 0.5,  // Default to 1/2 resolution
-            loaded_resolution: 0,
             render_quality: 0.5,  // Default to medium quality
+            opacity: 1.0,  // Default to fully opaque
+            cpu_volume_data: None,
+            hover_info: HoverInfo::default(),
         };
 
         app.fetch_volumes();
@@ -188,23 +218,23 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let state = self.async_state.clone();
             let url = format!("{}/api/volumes", self.api_base);
-            match reqwest::blocking::get(&url) {
-                Ok(response) => match response.json::<VolumeListResponse>() {
-                    Ok(data) => {
-                        self.volumes = data.volumes;
-                        self.loading = false;
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to parse response: {}", e));
-                        self.loading = false;
-                    }
-                },
-                Err(e) => {
-                    self.error = Some(format!("Failed to fetch volumes: {}", e));
-                    self.loading = false;
+
+            // Spawn background thread to avoid blocking render loop
+            std::thread::spawn(move || {
+                let result = match reqwest::blocking::get(&url) {
+                    Ok(response) => match response.json::<VolumeListResponse>() {
+                        Ok(data) => Ok(data.volumes),
+                        Err(e) => Err(format!("Failed to parse response: {}", e)),
+                    },
+                    Err(e) => Err(format!("Failed to fetch volumes: {}", e)),
+                };
+
+                if let Ok(mut state) = state.lock() {
+                    state.volumes = Some(result);
                 }
-            }
+            });
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -244,35 +274,38 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
+            let state = self.async_state.clone();
             let url = format!("{}/api/volumes/{}/full", self.api_base, volume_id);
-            match reqwest::blocking::get(&url) {
-                Ok(response) => match response.bytes() {
-                    Ok(bytes) => {
-                        if let Some(info) = volume_info {
-                            let data: Vec<f32> = bytes
-                                .chunks_exact(4)
-                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                                .collect();
 
-                            if let Ok(mut state) = self.async_state.lock() {
-                                state.volume_data = Some(Ok(VolumeData {
+            // Spawn background thread to avoid blocking render loop
+            std::thread::spawn(move || {
+                let result = match reqwest::blocking::get(&url) {
+                    Ok(response) => match response.bytes() {
+                        Ok(bytes) => {
+                            if let Some(info) = volume_info {
+                                let data: Vec<f32> = bytes
+                                    .chunks_exact(4)
+                                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                    .collect();
+
+                                Ok(VolumeData {
                                     data,
                                     dims: info.dimensions,
                                     value_range: info.value_range,
-                                }));
+                                })
+                            } else {
+                                Err("Volume info not found".to_string())
                             }
                         }
-                    }
-                    Err(e) => {
-                        self.error = Some(format!("Failed to read volume data: {}", e));
-                        self.loading_volume = false;
-                    }
-                },
-                Err(e) => {
-                    self.error = Some(format!("Failed to fetch volume: {}", e));
-                    self.loading_volume = false;
+                        Err(e) => Err(format!("Failed to read volume data: {}", e)),
+                    },
+                    Err(e) => Err(format!("Failed to fetch volume: {}", e)),
+                };
+
+                if let Ok(mut state) = state.lock() {
+                    state.volume_data = Some(result);
                 }
-            }
+            });
         }
 
         #[cfg(target_arch = "wasm32")]
@@ -322,115 +355,6 @@ impl App {
         }
     }
 
-    fn fetch_volume_at_resolution(&mut self, volume_id: &str, resolution: u32) {
-        self.loading_volume = true;
-
-        let volume_info = self.volumes.iter().find(|v| v.id == volume_id).cloned();
-
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let url = format!("{}/api/volumes/{}/at/{}", self.api_base, volume_id, resolution);
-            match reqwest::blocking::get(&url) {
-                Ok(response) => {
-                    // Get dimensions from header
-                    let dims: [u32; 3] = response
-                        .headers()
-                        .get("x-volume-dims")
-                        .and_then(|h| h.to_str().ok())
-                        .map(|s| {
-                            let parts: Vec<u32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
-                            if parts.len() == 3 {
-                                [parts[0], parts[1], parts[2]]
-                            } else {
-                                [resolution, resolution, resolution]
-                            }
-                        })
-                        .unwrap_or([resolution, resolution, resolution]);
-
-                    match response.bytes() {
-                        Ok(bytes) => {
-                            let data: Vec<f32> = bytes
-                                .chunks_exact(4)
-                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                                .collect();
-
-                            let value_range = volume_info.map(|i| i.value_range).unwrap_or([0.0, 1.0]);
-
-                            if let Ok(mut state) = self.async_state.lock() {
-                                state.volume_data = Some(Ok(VolumeData {
-                                    data,
-                                    dims,
-                                    value_range,
-                                }));
-                            }
-                        }
-                        Err(e) => {
-                            self.error = Some(format!("Failed to read volume data: {}", e));
-                            self.loading_volume = false;
-                        }
-                    }
-                }
-                Err(e) => {
-                    self.error = Some(format!("Failed to fetch volume: {}", e));
-                    self.loading_volume = false;
-                }
-            }
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            use gloo_net::http::Request;
-
-            let state = self.async_state.clone();
-            let url = format!("{}/api/volumes/{}/at/{}", self.api_base, volume_id, resolution);
-            let value_range = volume_info.map(|i| i.value_range).unwrap_or([0.0, 1.0]);
-
-            wasm_bindgen_futures::spawn_local(async move {
-                let result = async {
-                    let response = Request::get(&url)
-                        .send()
-                        .await
-                        .map_err(|e| format!("Request failed: {}", e))?;
-
-                    // Get dimensions from header
-                    let dims: [u32; 3] = response
-                        .headers()
-                        .get("x-volume-dims")
-                        .map(|s| {
-                            let parts: Vec<u32> = s.split(',').filter_map(|p| p.parse().ok()).collect();
-                            if parts.len() == 3 {
-                                [parts[0], parts[1], parts[2]]
-                            } else {
-                                [resolution, resolution, resolution]
-                            }
-                        })
-                        .unwrap_or([resolution, resolution, resolution]);
-
-                    let bytes = response
-                        .binary()
-                        .await
-                        .map_err(|e| format!("Failed to read bytes: {}", e))?;
-
-                    let data: Vec<f32> = bytes
-                        .chunks_exact(4)
-                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                        .collect();
-
-                    Ok::<_, String>(VolumeData {
-                        data,
-                        dims,
-                        value_range,
-                    })
-                }
-                .await;
-
-                if let Ok(mut state) = state.lock() {
-                    state.volume_data = Some(result);
-                }
-            });
-        }
-    }
-
     fn poll_async_state(&mut self) {
         if let Ok(mut state) = self.async_state.lock() {
             if let Some(result) = state.volumes.take() {
@@ -451,6 +375,8 @@ impl App {
                 match result {
                     Ok(data) => {
                         self.loading_volume = false;
+                        // Keep a CPU copy for hover raycasting
+                        self.cpu_volume_data = Some(data.clone());
                         // Store pending volume in shared state for callback to pick up
                         if let Ok(mut render_state) = self.shared_render_state.lock() {
                             render_state.params.value_range = data.value_range;
@@ -466,6 +392,72 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Raycast into volume to find first significant voxel
+    fn raycast_volume(&self, ray_origin: Vec3, ray_dir: Vec3) -> Option<HoverInfo> {
+        let vol_data = self.cpu_volume_data.as_ref()?;
+        let dims = vol_data.dims;
+        let value_range = vol_data.value_range;
+
+        // Ray-box intersection for unit cube [0,1]³
+        let inv_dir = Vec3::new(1.0 / ray_dir.x, 1.0 / ray_dir.y, 1.0 / ray_dir.z);
+        let t0 = (Vec3::ZERO - ray_origin) * inv_dir;
+        let t1 = (Vec3::ONE - ray_origin) * inv_dir;
+        let t_min = t0.min(t1);
+        let t_max = t0.max(t1);
+        let t_near = t_min.x.max(t_min.y).max(t_min.z).max(0.0);
+        let t_far = t_max.x.min(t_max.y).min(t_max.z);
+
+        if t_near > t_far {
+            return None;
+        }
+
+        // March through volume
+        let step_size = 0.01;
+        let mut t = t_near;
+        let threshold = 0.05; // Normalized threshold for "significant" voxel
+
+        while t < t_far {
+            let pos = ray_origin + ray_dir * t;
+
+            // Apply inverse rotation
+            let centered = pos - Vec3::new(0.5, 0.5, 0.5);
+            let rot_inv = glam::Mat4::from_quat(self.volume_rotation).transpose();
+            let rotated = rot_inv.transform_point3(centered);
+            let rotated_pos = rotated + Vec3::new(0.5, 0.5, 0.5);
+
+            // Check bounds
+            if rotated_pos.x >= 0.0 && rotated_pos.x <= 1.0 &&
+               rotated_pos.y >= 0.0 && rotated_pos.y <= 1.0 &&
+               rotated_pos.z >= 0.0 && rotated_pos.z <= 1.0 {
+
+                // Sample volume (trilinear approximation - just use nearest for simplicity)
+                let vx = ((rotated_pos.x * dims[0] as f32) as u32).min(dims[0] - 1);
+                let vy = ((rotated_pos.y * dims[1] as f32) as u32).min(dims[1] - 1);
+                let vz = ((rotated_pos.z * dims[2] as f32) as u32).min(dims[2] - 1);
+
+                let idx = (vx * dims[1] * dims[2] + vy * dims[2] + vz) as usize;
+                if idx < vol_data.data.len() {
+                    let value = vol_data.data[idx];
+                    let normalized = (value - value_range[0]) / (value_range[1] - value_range[0]);
+
+                    if normalized > threshold {
+                        return Some(HoverInfo {
+                            valid: true,
+                            position: [rotated_pos.x, rotated_pos.y, rotated_pos.z],
+                            value,
+                            normalized,
+                            voxel: [vx, vy, vz],
+                        });
+                    }
+                }
+            }
+
+            t += step_size;
+        }
+
+        None
     }
 
     fn render_sidebar(&mut self, ui: &mut egui::Ui) -> Option<String> {
@@ -574,49 +566,16 @@ impl App {
 
         ui.separator();
 
-        // Resolution slider (fraction of full resolution)
-        ui.label("Resolution:");
-        let old_fraction = self.resolution_fraction;
-
-        // Get max dimension from selected volume
-        let max_dim = self
-            .selected_volume
-            .as_ref()
-            .and_then(|id| self.volumes.iter().find(|v| &v.id == id))
-            .map(|v| v.dimensions[0].max(v.dimensions[1]).max(v.dimensions[2]))
-            .unwrap_or(512);
-
-        // Compute actual resolution from fraction
-        let target_resolution = ((max_dim as f32) * self.resolution_fraction).round() as u32;
-
-        // Custom formatter to show as fraction
-        let format_fraction = |f: f32| {
-            if (f - 1.0).abs() < 0.01 { "1".to_string() }
-            else if (f - 0.5).abs() < 0.01 { "1/2".to_string() }
-            else if (f - 0.25).abs() < 0.01 { "1/4".to_string() }
-            else if (f - 0.125).abs() < 0.01 { "1/8".to_string() }
-            else { format!("{:.0}%", f * 100.0) }
-        };
-
-        ui.add(
-            egui::Slider::new(&mut self.resolution_fraction, 0.125..=1.0)
-                .custom_formatter(|v, _| format_fraction(v as f32))
-                .text(format!("({}px)", target_resolution))
-        );
-
-        if (old_fraction - self.resolution_fraction).abs() > 0.001 && !self.loading_volume {
-            // Resolution changed, trigger reload if we have a volume selected
-            if let Some(ref id) = self.selected_volume {
-                volume_changed = Some(format!("{}@{}", id, target_resolution));
-            }
-        }
-
-        ui.separator();
-
         // Quality slider (affects render performance)
         ui.label("Quality:");
         ui.add(egui::Slider::new(&mut self.render_quality, 0.0..=1.0).text(""));
         ui.label(egui::RichText::new("(lower = faster)").small().weak());
+
+        ui.separator();
+
+        // Opacity slider
+        ui.label("Opacity:");
+        ui.add(egui::Slider::new(&mut self.opacity, 0.0..=1.0).text(""));
 
         ui.separator();
 
@@ -659,6 +618,36 @@ impl App {
             self.camera.zoom(scroll_delta * 0.01);
         }
 
+        // Handle hover for voxel info
+        if response.hovered() && self.has_volume && self.cpu_volume_data.is_some() {
+            if let Some(hover_pos) = response.hover_pos() {
+                // Convert screen position to normalized device coordinates
+                let ndc_x = (hover_pos.x - rect.center().x) / (rect.width() * 0.5);
+                let ndc_y = -(hover_pos.y - rect.center().y) / (rect.height() * 0.5);
+
+                // Get inverse view-projection matrix
+                let view_proj = self.camera.view_projection_matrix(aspect_ratio);
+                let inv_view_proj = view_proj.inverse();
+
+                // Unproject to world space
+                let near_point = inv_view_proj.project_point3(glam::Vec3::new(ndc_x, ndc_y, -1.0));
+                let far_point = inv_view_proj.project_point3(glam::Vec3::new(ndc_x, ndc_y, 1.0));
+
+                // Ray in world space (shifted to volume [0,1] space)
+                let ray_origin = near_point + Vec3::new(0.5, 0.5, 0.5);
+                let ray_dir = (far_point - near_point).normalize();
+
+                // Raycast into volume
+                if let Some(info) = self.raycast_volume(ray_origin, ray_dir) {
+                    self.hover_info = info;
+                } else {
+                    self.hover_info.valid = false;
+                }
+            }
+        } else {
+            self.hover_info.valid = false;
+        }
+
         // Build volume rotation matrix from quaternion
         let volume_rotation = glam::Mat4::from_quat(self.volume_rotation);
 
@@ -675,6 +664,7 @@ impl App {
             state.params.volume_rotation = volume_rotation;
             state.params.show_axes = self.show_axes;
             state.params.step_size = step_size;
+            state.params.opacity = self.opacity;
         }
 
         if !self.has_volume {
@@ -692,7 +682,7 @@ impl App {
                 rect.center(),
                 egui::Align2::CENTER_CENTER,
                 text,
-                egui::FontId::proportional(24.0),
+                egui::FontId::monospace(20.0),
                 egui::Color32::GRAY,
             );
         } else {
@@ -739,6 +729,7 @@ impl App {
                                         state.params.step_size,
                                         state.params.value_range,
                                         &state.params.volume_rotation,
+                                        state.params.opacity,
                                     );
 
                                     // Render axes if enabled
@@ -756,6 +747,62 @@ impl App {
                 })),
             };
             ui.painter().add(callback);
+
+            // Show hover info overlay
+            if self.hover_info.valid {
+                let info = &self.hover_info;
+
+                // Position the info panel in the top-left corner of the viewport
+                let panel_pos = rect.left_top() + egui::vec2(10.0, 10.0);
+
+                let panel_rect = egui::Rect::from_min_size(
+                    panel_pos,
+                    egui::vec2(160.0, 80.0),
+                );
+
+                // Draw background
+                ui.painter().rect_filled(
+                    panel_rect,
+                    4.0,
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220),
+                );
+
+                // Draw info text
+                let text_pos = panel_pos + egui::vec2(8.0, 8.0);
+                let line_height = 16.0;
+
+                ui.painter().text(
+                    text_pos,
+                    egui::Align2::LEFT_TOP,
+                    format!("Voxel: ({}, {}, {})", info.voxel[0], info.voxel[1], info.voxel[2]),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+
+                ui.painter().text(
+                    text_pos + egui::vec2(0.0, line_height),
+                    egui::Align2::LEFT_TOP,
+                    format!("Value: {:.4}", info.value),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+
+                ui.painter().text(
+                    text_pos + egui::vec2(0.0, line_height * 2.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("Intensity: {:.1}%", info.normalized * 100.0),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+
+                ui.painter().text(
+                    text_pos + egui::vec2(0.0, line_height * 3.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("Pos: ({:.2}, {:.2}, {:.2})", info.position[0], info.position[1], info.position[2]),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::GRAY,
+                );
+            }
         }
 
         // Request continuous repaint for smooth interaction
@@ -801,35 +848,16 @@ impl eframe::App for App {
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
                     "OpenGL not available",
-                    egui::FontId::proportional(24.0),
+                    egui::FontId::monospace(20.0),
                     egui::Color32::RED,
                 );
             }
         });
 
-        if let Some(volume_request) = volume_to_fetch {
-            // Check if this is a resolution change (format: "volume_id@resolution")
-            if let Some((volume_id, resolution_str)) = volume_request.split_once('@') {
-                if let Ok(resolution) = resolution_str.parse::<u32>() {
-                    // Resolution change request
-                    self.fetch_volume_at_resolution(volume_id, resolution);
-                    self.loaded_resolution = resolution;
-                }
-            } else {
-                // Normal volume selection
-                let volume_id = volume_request;
-                if self.loaded_volume.as_ref() != Some(&volume_id) {
-                    // Compute target resolution from fraction and volume dimensions
-                    let max_dim = self
-                        .volumes
-                        .iter()
-                        .find(|v| v.id == volume_id)
-                        .map(|v| v.dimensions[0].max(v.dimensions[1]).max(v.dimensions[2]))
-                        .unwrap_or(512);
-                    let target_res = ((max_dim as f32) * self.resolution_fraction).round() as u32;
-                    self.fetch_volume_at_resolution(&volume_id, target_res);
-                    self.loaded_resolution = target_res;
-                }
+        if let Some(volume_id) = volume_to_fetch {
+            if self.loaded_volume.as_ref() != Some(&volume_id) {
+                // Always load at full resolution
+                self.fetch_volume_data(&volume_id);
             }
         }
     }
