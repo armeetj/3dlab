@@ -1,0 +1,14 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "index.html"]
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 3000
+
+[[proxy]]
+backend = "http://localhost:9000/api"
+rewrite = "/api"

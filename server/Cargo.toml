@@ -1,0 +1,27 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shared = { path = "../shared" }
+
+# Web framework
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+
+# HDF5 reading - using git version for newer HDF5 support
+hdf5 = { git = "https://github.com/aldanor/hdf5-rust", branch = "master" }
+ndarray = "0.15"  # Match hdf5's ndarray version
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Logging
+log.workspace = true
+env_logger.workspace = true
+
+# Error handling
+thiserror.workspace = true

@@ -1,0 +1,10 @@
+[project]
+name = "3dlab"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "h5py>=3.15.1",
+    "numpy>=2.3.5",
+]
