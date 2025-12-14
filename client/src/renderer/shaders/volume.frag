@@ -55,7 +55,7 @@ void main() {
 
     // Start ray marching
     float t_current = t.x;
-    const int max_steps = 256;
+    const int max_steps = 128;
 
     for (int i = 0; i < max_steps; i++) {
         if (t_current > t.y || color.a > 0.95) {
@@ -80,6 +80,13 @@ void main() {
         }
 
         float density = texture(u_volume, tex_coord).r;
+
+        // Empty space skipping: take larger steps through low-density regions
+        float normalized_density = (density - u_value_min) / (u_value_max - u_value_min);
+        if (normalized_density < 0.02) {
+            t_current += u_step_size * 4.0;
+            continue;
+        }
 
         // Apply transfer function
         vec4 sample_color = transfer_function(density);

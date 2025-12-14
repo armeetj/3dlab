@@ -86,10 +86,12 @@ pub struct App {
     volume_euler_deg: [f32; 3],
     /// Show XYZ axis indicators
     show_axes: bool,
-    /// Target resolution for volume (largest dimension)
-    target_resolution: u32,
+    /// Resolution fraction (0.125 = 1/8, 1.0 = full)
+    resolution_fraction: f32,
     /// Currently loaded resolution
     loaded_resolution: u32,
+    /// Render quality (0.0 = fast/low, 1.0 = slow/high)
+    render_quality: f32,
 }
 
 impl App {
@@ -171,8 +173,9 @@ impl App {
             volume_rotation: glam::Quat::IDENTITY,
             volume_euler_deg: [0.0, 0.0, 0.0],
             show_axes: true,
-            target_resolution: 256,
+            resolution_fraction: 0.5,  // Default to 1/2 resolution
             loaded_resolution: 0,
+            render_quality: 0.5,  // Default to medium quality
         };
 
         app.fetch_volumes();
@@ -571,16 +574,49 @@ impl App {
 
         ui.separator();
 
-        // Resolution slider
+        // Resolution slider (fraction of full resolution)
         ui.label("Resolution:");
-        let old_resolution = self.target_resolution;
-        ui.add(egui::Slider::new(&mut self.target_resolution, 32..=512).text("px"));
-        if old_resolution != self.target_resolution && !self.loading_volume {
+        let old_fraction = self.resolution_fraction;
+
+        // Get max dimension from selected volume
+        let max_dim = self
+            .selected_volume
+            .as_ref()
+            .and_then(|id| self.volumes.iter().find(|v| &v.id == id))
+            .map(|v| v.dimensions[0].max(v.dimensions[1]).max(v.dimensions[2]))
+            .unwrap_or(512);
+
+        // Compute actual resolution from fraction
+        let target_resolution = ((max_dim as f32) * self.resolution_fraction).round() as u32;
+
+        // Custom formatter to show as fraction
+        let format_fraction = |f: f32| {
+            if (f - 1.0).abs() < 0.01 { "1".to_string() }
+            else if (f - 0.5).abs() < 0.01 { "1/2".to_string() }
+            else if (f - 0.25).abs() < 0.01 { "1/4".to_string() }
+            else if (f - 0.125).abs() < 0.01 { "1/8".to_string() }
+            else { format!("{:.0}%", f * 100.0) }
+        };
+
+        ui.add(
+            egui::Slider::new(&mut self.resolution_fraction, 0.125..=1.0)
+                .custom_formatter(|v, _| format_fraction(v as f32))
+                .text(format!("({}px)", target_resolution))
+        );
+
+        if (old_fraction - self.resolution_fraction).abs() > 0.001 && !self.loading_volume {
             // Resolution changed, trigger reload if we have a volume selected
             if let Some(ref id) = self.selected_volume {
-                volume_changed = Some(format!("{}@{}", id, self.target_resolution));
+                volume_changed = Some(format!("{}@{}", id, target_resolution));
             }
         }
+
+        ui.separator();
+
+        // Quality slider (affects render performance)
+        ui.label("Quality:");
+        ui.add(egui::Slider::new(&mut self.render_quality, 0.0..=1.0).text(""));
+        ui.label(egui::RichText::new("(lower = faster)").small().weak());
 
         ui.separator();
 
@@ -626,6 +662,10 @@ impl App {
         // Build volume rotation matrix from quaternion
         let volume_rotation = glam::Mat4::from_quat(self.volume_rotation);
 
+        // Compute step_size from quality (0.0 = fast/large steps, 1.0 = slow/small steps)
+        // Range: 0.02 (fast) to 0.003 (high quality)
+        let step_size = 0.02 - (self.render_quality * 0.017);
+
         // Update shared render state with camera params
         if let Ok(mut state) = self.shared_render_state.lock() {
             state.params.camera_position = self.camera.position();
@@ -634,6 +674,7 @@ impl App {
             state.params.has_volume = self.has_volume;
             state.params.volume_rotation = volume_rotation;
             state.params.show_axes = self.show_axes;
+            state.params.step_size = step_size;
         }
 
         if !self.has_volume {
@@ -778,8 +819,16 @@ impl eframe::App for App {
                 // Normal volume selection
                 let volume_id = volume_request;
                 if self.loaded_volume.as_ref() != Some(&volume_id) {
-                    self.fetch_volume_at_resolution(&volume_id, self.target_resolution);
-                    self.loaded_resolution = self.target_resolution;
+                    // Compute target resolution from fraction and volume dimensions
+                    let max_dim = self
+                        .volumes
+                        .iter()
+                        .find(|v| v.id == volume_id)
+                        .map(|v| v.dimensions[0].max(v.dimensions[1]).max(v.dimensions[2]))
+                        .unwrap_or(512);
+                    let target_res = ((max_dim as f32) * self.resolution_fraction).round() as u32;
+                    self.fetch_volume_at_resolution(&volume_id, target_res);
+                    self.loaded_resolution = target_res;
                 }
             }
         }
