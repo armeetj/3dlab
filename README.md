@@ -6,7 +6,9 @@ A WebGL-based 3D MRI volume renderer. Rust server reads HDF5 files, Rust/WASM cl
 
 Right now, I can render a 512x512x160 (~170MB) volume in the browser at ~20 fps on my 2021 M1 Pro Macbook Pro.
 
-<img width="2535" height="1350" alt="image" src="https://github.com/user-attachments/assets/996e8c92-9cce-43a0-805c-91737a65b24c" />
+
+https://github.com/user-attachments/assets/820ffc17-d1ed-4789-b87b-7b8dd335165b
+
 
 
 **Important:** This is a hobby project and not production-ready software. I'm no graphics/shader specialist and much of the project was written with heavy assistance from my good friend Opus at Claude Code :)
