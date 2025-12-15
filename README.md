@@ -1,5 +1,7 @@
 # 3DLab
 
+[![Live Demo](https://img.shields.io/badge/🔬_Live_Demo-3dlab.fly.dev-blue?style=for-the-badge)](https://3dlab.fly.dev/)
+
 A WebGL-based 3D MRI volume renderer. Rust server reads HDF5 files, Rust/WASM client renders in browser. Originally made to address a problem I had when working on AI models for MRI recon at Caltech. The 3D volumes I was working with were too large to visualize with standard python plotting tools. At best, I would generate 2D cross-section visualizations with matplotlib or plotly. I wrote this simple renderer to quickly visualize 3D MRI volumes in the browser, but it should work for any 3D volume stored in HDF5 format.
 
 Right now, I can render a 512x512x160 (~170MB) volume in the browser at ~20 fps on my 2021 M1 Pro Macbook Pro.
